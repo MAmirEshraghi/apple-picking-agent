@@ -1,3 +1,152 @@
+# apple-picking-agent
+
+Expert data generation and policy learning (behaviour cloning, PPO+BC) for a UR5 arm reaching apples on
+simulated trees. The robot, tree and sensor simulation comes from the separate simulator package
+`pybullet_tree_sim`, developed in the fork
+[MAmirEshraghi/UR5-ApplePathPlanning-Sim-PyBullet](https://github.com/MAmirEshraghi/UR5-ApplePathPlanning-Sim-PyBullet).
+
+**Pipeline:** RRT-Connect planner → waypoints → closed-loop expert rollouts → validated HDF5 dataset →
+BC / PPO+BC training → evaluation in simulation.
+
+---
+
+## 1. Requirements
+- Linux, Python 3.10, a CUDA GPU for training (CPU works for data generation, validation and small BC runs).
+- The simulator package `pybullet_tree_sim` and its data: tree meshes (~13 GB, from its `mesh_downloader`)
+  and textures.
+- ROS 2 is **not** needed. (Only regenerating the simulator's robot URDF from xacro needs it.)
+
+## 2. Installation
+
+```bash
+git clone https://github.com/MAmirEshraghi/apple-picking-agent.git
+cd apple-picking-agent
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .            # installs this package and the simulator pinned in pyproject.toml
+```
+
+**Developing the simulator at the same time.** Clone the fork next to this repo and install both
+editable. The simulator is then used from your local clone:
+
+```bash
+git clone -b refactor/prepare-split https://github.com/MAmirEshraghi/UR5-ApplePathPlanning-Sim-PyBullet.git
+pip install -e UR5-ApplePathPlanning-Sim-PyBullet
+pip install -e apple-picking-agent --no-deps
+```
+
+Without installing anything, `export PYTHONPATH=<path>/apple-picking-agent:<path>/UR5-ApplePathPlanning-Sim-PyBullet`
+works too.
+
+### Simulator data (meshes, textures)
+Meshes and some textures are not in git. Either:
+- download them into the simulator package with its `mesh_downloader` command (editable installs), or
+- point `PYBULLET_TREE_SIM_DATA` at a folder with the simulator's data layout, e.g. an existing
+  `UR5-ApplePathPlanning-Sim-PyBullet/pybullet_tree_sim` that already has them:
+
+```bash
+export PYBULLET_TREE_SIM_DATA=/path/to/UR5-ApplePathPlanning-Sim-PyBullet/pybullet_tree_sim
+# must contain meshes/, textures/, pkl/ and urdf/ (generated tree URDFs and caches are written there)
+```
+
+## 3. Workspace
+All commands run from a **workspace folder**. Paths are relative to it:
+
+```
+<workspace>/
+  output/waypoints/<run_id>.hdf5    planner output (stage 1)
+  output/agent_data/<run_id>.hdf5   expert datasets (schema v2)
+  logs/                             text logs, checkpoints (logs/<run_name>/model_<N>_steps.zip), eval JSON
+  runs/                             TensorBoard
+```
+
+The repo root can serve as the workspace (`output/`, `logs/` and `runs/` are git-ignored). Existing
+data can be reused with a symlink, e.g. `ln -s /path/to/old/output output`.
+
+## 4. Usage
+
+### 4.1 Plan waypoints (stage 1)
+```bash
+python -m apple_agent.planning.run_apple_data_generator --stage planner --tree-id 8 --run_id tree08 --no-render
+```
+This writes collision-free RRT-Connect paths to the pre-grasp pose of each apple into `output/waypoints/tree08.hdf5`.
+Add `--visualize_planning` to replay saved paths in the GUI.
+
+### 4.2 Generate expert data (stage 2)
+```bash
+python -m apple_agent.data.generate_expert_data --run-id tree08 --out-id tree08_v2
+#   --path-rank 1        only the best path per apple
+#   --save-only-success  drop failed rollouts (otherwise kept for RL; BC uses successes only)
+#   --max-groups N       quick test on N groups
+```
+- Each path is executed with a closed-loop Jacobian controller in `ApplePickingEnv` (headless, same renderer
+  as training).
+- Each trajectory is saved once per frame in **agent-data schema v2**: RGB, metric depth (mm), apple mask,
+  proprioception, `pregrasp_in_tool` target, actions, rewards and terminal/truncated flags.
+- Merge several trees: `python -m apple_agent.data.merge_agent_data --range 0-9 --prefix tree --output trees00to09_v2`
+  (inputs need the same naming, e.g. `tree00_v2`: use `--inputs` for explicit ids).
+
+### 4.3 Validate before training
+```bash
+python -m apple_agent.data.validate_agent_data --run-id tree08_v2 --policy-smoke --replay 2
+```
+Checks schema, depth, frame motion, targets and success, builds the policy for every input setting
+(`--policy-smoke`) and replays trajectories in the simulator (`--replay N`). Exit code 1 on failure.
+Log: `logs/validate_agent_data/`.
+
+### 4.4 Train
+Behaviour cloning only (no simulation; fast):
+```bash
+python -m apple_agent.rl.train_apple_picking_expert --run_id tree08_v2 --run_name dm_bc \
+    --image_channels depth,mask --bc_only --bc_warmup_steps 0 \
+    --total_timesteps 20000 --checkpoint_freq 5000 --no-memory_debug
+```
+PPO+BC fine-tuning from a BC checkpoint (GPU recommended):
+```bash
+python -m apple_agent.rl.train_apple_picking_expert --run_id tree08_v2 --run_name dm_ppo \
+    --image_channels depth,mask --load_checkpoint logs/dm_bc/model_20000_steps.zip \
+    --bc_warmup_steps 0 --bc_coeff 1.0 --total_timesteps 50000 --checkpoint_freq 5000 --no-memory_debug
+```
+- `--image_channels`: any of `flow`, `depth`, `mask`, or `none` (proprioception only). It must match the
+  checkpoint when resuming. `depth,mask` is the recommended setting; `flow` tends to copy the previous
+  motion under BC.
+- `--total_timesteps` counts environment steps (when resuming: steps added). One PPO update every 512 steps.
+- Checkpoints go to `logs/<run_name>/` and TensorBoard to `runs/<run_name>`.
+- Training needs about 2–3 GB of RAM for depth+mask buffers (more with flow).
+
+### 4.5 Evaluate and inspect
+```bash
+python -m apple_agent.rl.eval_apple_picking_expert --run_id tree08_v2 \
+    --checkpoint logs/dm_bc/model_20000_steps.zip --eval_all --max_steps 150 --output logs/eval/dm_bc_20k.json
+python -m apple_agent.rl.replay_expert_actions --run_id tree08_v2 --n_episodes 5    # expert actions open-loop
+python -m apple_agent.rl.debug.run_all_step0 --run_id tree08_v2 --checkpoint <zip> # step-0 diagnostics
+```
+Eval reads the input channels from the checkpoint. It reports success, collision and timeout rates, and the
+final distance to the target. `--max_steps 150` is about 1.3× the longest expert trajectory.
+
+## 5. Package layout
+| Path | Contents |
+|---|---|
+| `apple_agent/config.py` | Shared `CONFIG`: simulation, robot, tree, planning, generator and output settings |
+| `apple_agent/envs/` | `ApplePickingEnv` (Gymnasium) and tool/world frame conversions |
+| `apple_agent/planning/` | RRT-Connect planner (stage 1), goal camera filter |
+| `apple_agent/data/` | `agent_data` (schema v2 I/O), `obs_spec`, `generate_expert_data`, `validate_agent_data`, `merge_agent_data` |
+| `apple_agent/rl/` | Train / eval / replay entry points; `debug/` diagnostics |
+| `apple_agent/apple_picking_sb3/` | SB3 PPO+BC with LSTM policy (`algo/PPOLSTMAE`), encoder, optical flow, callbacks (`apple_gym/`) |
+| `apple_agent/legacy/` | Old scripts and unused vendored modules, kept for reference only (not maintained) |
+
+## 6. Notes
+- **Observation:** proprioception, apple centre and pre-grasp target in the tool frame, plus the chosen image
+  channels from the wrist RGB-D camera. **Action:** 6-D tool-frame velocity in [-1, 1].
+- **Checkpoints from earlier versions** of this package load unchanged: an import alias maps old module names.
+- **Simulator settings this package relies on:** `PYBULLET_TREE_SIM_DATA` (data root), and the simulator's
+  portable `robot.urdf` with bundled meshes.
+- **Results so far** (tree 08, 10 demos, BC 20k steps, 150-step eval): depth+mask 50% success / 0% collisions;
+  proprio-only 60% / 20%; flow+mask 0% / 60%.
+
+---
+
+# OLD
+
 # Perception-Guided Motion Planning and Deep Reinforcement Learning for Robotic Fruit Harvesting
 
 ### 🎥 Demo Video

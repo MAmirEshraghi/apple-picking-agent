@@ -96,13 +96,23 @@ python -m apple_agent.planning.run_apple_data_generator --stage axis_test
 
 ## Setup and running
 
-This package (`apple_agent`) depends on the simulator package `pybullet_tree_sim`. Today both live in one
-repository: the simulator at the repo root, this package under `agent/`. It is prepared to move into its own
-repository later, with the simulator installed as a pinned dependency (see `agent/pyproject.toml`).
+This package (`apple_agent`) runs on the simulator package `pybullet_tree_sim`, developed in the fork
+[MAmirEshraghi/UR5-ApplePathPlanning-Sim-PyBullet](https://github.com/MAmirEshraghi/UR5-ApplePathPlanning-Sim-PyBullet)
+and pinned in `pyproject.toml`.
 
 ```bash
-# from the repository root (the workspace), venv activated
-export PYTHONPATH=$PWD/agent            # or: pip install -e agent   (and pip install -e . for the simulator)
+# install (venv activated)
+pip install -e .                                         # installs the pinned simulator too
+# or, when changing the simulator as well:
+pip install -e ../UR5-ApplePathPlanning-Sim-PyBullet && pip install -e . --no-deps
+```
+
+The simulator's meshes and textures are not in git (meshes come from its `mesh_downloader`). If the simulator is
+installed read-only (not editable), point `PYBULLET_TREE_SIM_DATA` at a folder with its data layout
+(`meshes/`, `textures/`, `pkl/`, `urdf/`), e.g. an existing `pybullet_tree_sim/` directory.
+
+```bash
+# run from the workspace root (where output/, logs/ and runs/ are created)
 python -m apple_agent.planning.run_apple_data_generator --stage planner      # RRT waypoints -> output/waypoints/
 python -m apple_agent.data.generate_expert_data --run-id tree08 --out-id tree08_v2
 python -m apple_agent.data.validate_agent_data --run-id tree08_v2 --policy-smoke --replay 2
@@ -110,17 +120,11 @@ python -m apple_agent.rl.train_apple_picking_expert --run_id tree08_v2 --run_nam
 python -m apple_agent.rl.eval_apple_picking_expert --run_id tree08_v2 --checkpoint logs/<name>/model_20000_steps.zip --eval_all --max_steps 150
 ```
 
-Commands run from the **workspace root**: `output/` (waypoints, agent data), `logs/` and `runs/` are
-relative to the current directory.
-
-If the simulator is installed read-only, point `PYBULLET_TREE_SIM_DATA` at a folder with the simulator's
-data layout (`meshes/`, `textures/`, `pkl/`, `urdf/`).
-
 ### Package layout
 - `apple_agent/config.py`: shared `CONFIG` (simulation, robot, tree, planning, generator, output)
 - `apple_agent/envs/`: `ApplePickingEnv` and frame conversions
-- `apple_agent/planning/`: RRT-Connect planner (stage 1), goal camera filter, debug visualisation
+- `apple_agent/planning/`: RRT-Connect planner (stage 1) and goal camera filter
 - `apple_agent/data/`: agent-data schema v2 I/O, observation spec, expert generator, validator, merge tool
 - `apple_agent/rl/`: train / eval / replay entry points and debug diagnostics
 - `apple_agent/apple_picking_sb3/`: vendored SB3 algorithms (PPO+BC with LSTM) and helpers
-- `apple_agent/legacy/`: old playground and archive scripts, kept for reference only
+- `apple_agent/legacy/`: old playground and archive scripts, and unused vendored modules (`unused_apple_picking_sb3/`, see its `MOVED.md`); kept for reference only

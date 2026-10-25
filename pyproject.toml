@@ -9,9 +9,9 @@ description = "Expert data generation and RL/BC training for UR5 apple picking o
 requires-python = ">=3.9"
 authors = [{ name = "Robin Eshraghi" }]
 dependencies = [
-    # Simulator (sibling directory today; after the split pin a tag, e.g.
-    # "pybullet_tree_sim @ git+https://github.com/<user>/<sim-fork>@v0.1.0").
-    "pybullet_tree_sim",
+    # Simulator, pinned to a commit of the fork (replace with a release tag once one exists).
+    # For simulator development install a local clone instead: pip install -e ../UR5-ApplePathPlanning-Sim-PyBullet
+    "pybullet_tree_sim @ git+https://github.com/MAmirEshraghi/UR5-ApplePathPlanning-Sim-PyBullet@fd5acbc7e89778d97eb0073f80202ccae828165e",
     "numpy==1.26.4",
     "filelock",
     "gymnasium",

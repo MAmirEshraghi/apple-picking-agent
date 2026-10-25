@@ -183,10 +183,9 @@ def add_arg_to_env(key, val, env_name, parsed_args_dict):
 
 
 def make_or_bins(args, train_type, tree_type):
-    """Old pruning-env helper, never called by the apple pipeline. It needs the pruning env, now in
-    apple_agent/legacy/unused_apple_picking_sb3/pruning_gym/. Original body: commit 8168e4f,
-    feature_apple_agent/apple_picking_sb3/pruning_gym/helpers.py."""
-    raise NotImplementedError("make_or_bins depends on the unused pruning env (see legacy/unused_apple_picking_sb3)")
+    """Unused helper from the original codebase; it needs the old tree environment kept in
+    apple_agent/legacy/unused_apple_picking_sb3/. Original body: commit 8168e4f (helpers.py)."""
+    raise NotImplementedError("make_or_bins needs the old environment in apple_agent/legacy/unused_apple_picking_sb3")
 
 
 def get_policy_kwargs(args_policy, args_env, features_extractor_class):

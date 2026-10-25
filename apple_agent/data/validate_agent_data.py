@@ -125,7 +125,7 @@ def policy_smoke(path: Path) -> None:
     from gymnasium import spaces
     from sb3_contrib.common.recurrent.type_aliases import RNNStates
     from apple_agent.apple_picking_sb3.algo.PPOLSTMAE.policies import RecurrentActorCriticPolicy
-    from apple_agent.apple_picking_sb3.pruning_gym.models import Encoder
+    from apple_agent.apple_picking_sb3.apple_gym.models import Encoder
     from apple_agent.data.obs_spec import image_keys_for_channels
 
     with h5py.File(path, "r") as f:
@@ -243,7 +243,7 @@ def main() -> int:
         return 1
     flow_model = None
     if not args.no_flow_stats:
-        from apple_agent.apple_picking_sb3.pruning_gym.optical_flow import OpticalFlow
+        from apple_agent.apple_picking_sb3.apple_gym.optical_flow import OpticalFlow
         flow_model = OpticalFlow(size=(224, 224))
     with h5py.File(path, "r") as f:
         keys = list(f.keys())

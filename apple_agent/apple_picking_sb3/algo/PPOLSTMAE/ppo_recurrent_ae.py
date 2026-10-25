@@ -18,7 +18,7 @@ from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
 from sb3_contrib.common.recurrent.type_aliases import RNNStates
 # from sb3_contrib.ppo_recurrent.policies import CnnLstmPolicy, MlpLstmPolicy, MultiInputLstmPolicy
 from stable_baselines3.common.buffers import RolloutBuffer
-from apple_agent.apple_picking_sb3.pruning_gym.callbacks.train_callbacks import iter_all_callbacks
+from apple_agent.apple_picking_sb3.apple_gym.callbacks.train_callbacks import iter_all_callbacks
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import Image
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm

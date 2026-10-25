@@ -3,7 +3,7 @@ import random
 
 import numpy as np
 import torch as th
-from apple_agent.apple_picking_sb3.pruning_gym.callbacks.callbacks import PruningSetGoalCallback
+from apple_agent.apple_picking_sb3.apple_gym.callbacks.callbacks import AppleSetGoalCallback
 from typing import Iterator
 
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
@@ -19,9 +19,9 @@ def iter_all_callbacks(callback) -> Iterator[BaseCallback]:
         yield callback
 
 
-class Pruning1TreeSetGoalCallback(PruningSetGoalCallback):
+class Apple1TreeSetGoalCallback(AppleSetGoalCallback):
     def __init__(self, tree_info,  verbose=0):
-        super(Pruning1TreeSetGoalCallback, self).__init__(verbose)
+        super(Apple1TreeSetGoalCallback, self).__init__(verbose)
         self.tree_info = tree_info
 
     def _init_callback(self) -> None:
@@ -42,9 +42,9 @@ class Pruning1TreeSetGoalCallback(PruningSetGoalCallback):
         return
 
 
-class PruningTrainSetGoalCallback(PruningSetGoalCallback):
+class AppleTrainSetGoalCallback(AppleSetGoalCallback):
     def __init__(self, or_bins, verbose=0):
-        super(PruningTrainSetGoalCallback, self).__init__(verbose)
+        super(AppleTrainSetGoalCallback, self).__init__(verbose)
         self.or_bins = or_bins
 
         #TODO: Make this an argument to the callback
@@ -93,9 +93,9 @@ class PruningTrainSetGoalCallback(PruningSetGoalCallback):
         return True
 
 
-class PruningTrainRecordEnvCallback(BaseCallback):
+class AppleTrainRecordEnvCallback(BaseCallback):
     def __init__(self, verbose=0):
-        super(PruningTrainRecordEnvCallback, self).__init__(verbose)
+        super(AppleTrainRecordEnvCallback, self).__init__(verbose)
         self._screens_buffer = []
 
     def reset_buffer(self):
@@ -126,7 +126,7 @@ class PruningTrainRecordEnvCallback(BaseCallback):
         self.reset_buffer()
 
 
-class PruningCheckpointCallback(CheckpointCallback):
+class AppleCheckpointCallback(CheckpointCallback):
     _SAVE_EXCLUDE = [
         "_last_obs", "_last_episode_starts", "_last_original_obs",
         "expert_buffer", "expert_data", "expert_batch_idx",
@@ -136,7 +136,7 @@ class PruningCheckpointCallback(CheckpointCallback):
     ]
 
     def __init__(self, save_freq: int, save_path: str, name_prefix: str = "rl_model", verbose=0):
-        super(PruningCheckpointCallback, self).__init__(save_freq, save_path, name_prefix, verbose)
+        super(AppleCheckpointCallback, self).__init__(save_freq, save_path, name_prefix, verbose)
         self._last_saved_ts = 0
 
     def _init_callback(self) -> None:

@@ -5,11 +5,11 @@ import random
 from abc import abstractmethod
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback, EventCallback
-from apple_agent.apple_picking_sb3.pruning_gym.helpers import roundup, rounddown
+from apple_agent.apple_picking_sb3.apple_gym.helpers import roundup, rounddown
 
-class PruningSetGoalCallback(BaseCallback):
+class AppleSetGoalCallback(BaseCallback):
     def __init__(self, verbose=0):
-        super(PruningSetGoalCallback, self).__init__(verbose)
+        super(AppleSetGoalCallback, self).__init__(verbose)
         self.or_bins = None
         self.delta_pos_max = None
         self.delta_pos_min = None
@@ -189,9 +189,9 @@ class EveryNRollouts(EventCallback):
         return True
 
 
-class PruningLogCallback(BaseCallback):
+class AppleLogCallback(BaseCallback):
     def __init__(self, expert = False, verbose=0):
-        super(PruningLogCallback, self).__init__(verbose)
+        super(AppleLogCallback, self).__init__(verbose)
         self._reward_dict = {}
         self._info_dict = {}
         self._collisions_acceptable_buffer = []

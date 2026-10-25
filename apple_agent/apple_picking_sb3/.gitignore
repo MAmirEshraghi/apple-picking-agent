@@ -7,7 +7,7 @@
 ../.idea/
 wandb/*
 *media*
-pruning_sb3/pkl/*
+pkl/*
 *.json
 # Vagrant
 .vagrant/
@@ -134,7 +134,7 @@ dmypy.json
 
 #Custom
 runs
-pruning_sb3/logs/*
+logs/*
 runs/
 *.csv
 logs/

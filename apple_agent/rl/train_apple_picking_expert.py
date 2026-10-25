@@ -21,16 +21,13 @@ from apple_agent.planning.run_apple_data_generator import (
     tree_id_str_from_config,
 )
 
-# --- Imports from Pruning SB3 Project ---
+# --- SB3 policy, algorithm, encoder and callbacks ---
 from apple_agent.apple_picking_sb3.algo.PPOLSTMAE.policies import RecurrentActorCriticPolicy
-#from pruning_sb3.ppo_recurrent_ae import RecurrentPPOAEWithExpert
 from apple_agent.apple_picking_sb3.algo.PPOLSTMAE.ppo_recurrent_ae import RecurrentPPOAEWithExpert
-#from pruning_sb3.policies import RecurrentActorCriticPolicy
-#from pruning_sb3.models import Encoder
-from apple_agent.apple_picking_sb3.pruning_gym.models import Encoder
+from apple_agent.apple_picking_sb3.apple_gym.models import Encoder
 
 #from train_callbacks
-from apple_agent.apple_picking_sb3.pruning_gym.callbacks.train_callbacks import PruningCheckpointCallback
+from apple_agent.apple_picking_sb3.apple_gym.callbacks.train_callbacks import AppleCheckpointCallback
 
 from stable_baselines3.common.callbacks import BaseCallback
 
@@ -789,7 +786,7 @@ if __name__ == "__main__":
         callback_list = [bc_warmup_callback, imitation_callback]
         if args.checkpoint_freq is not None:
             callback_list.append(
-                PruningCheckpointCallback(
+                AppleCheckpointCallback(
                     save_freq=args.checkpoint_freq,
                     save_path=f"./logs/{run_name}",
                     name_prefix="model",
@@ -939,7 +936,7 @@ if __name__ == "__main__":
 
         # Same exclusions as periodic checkpoints: pickling the rollout/expert buffers (GBs of images)
         # made final_model.zip ~0.6 GB and got the process OOM-killed mid-save on flow runs.
-        model.save(str(save_dir / "final_model.zip"), exclude=PruningCheckpointCallback._SAVE_EXCLUDE)
+        model.save(str(save_dir / "final_model.zip"), exclude=AppleCheckpointCallback._SAVE_EXCLUDE)
         print("INFO: Training complete. Final model saved.")
 
     except BaseException:

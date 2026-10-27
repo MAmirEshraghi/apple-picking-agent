@@ -84,6 +84,8 @@ python -m apple_agent.data.generate_expert_data --run-id tree08 --out-id tree08_
   as training).
 - Each trajectory is saved once per frame in **agent-data schema v2**: RGB, metric depth (mm), apple mask,
   proprioception, `pregrasp_in_tool` target, actions, rewards and terminal/truncated flags.
+- The controller settings (`--step-scale` 1.4, `--action-smoothing-alpha`, `--record-joint-dq-cap`, …) are saved
+  with each trajectory as `gen_*` attributes. Log: `logs/generate_expert_data/`.
 - Merge several trees: `python -m apple_agent.data.merge_agent_data --range 0-9 --prefix tree --output trees00to09_v2`
   (inputs need the same naming, e.g. `tree00_v2`: use `--inputs` for explicit ids).
 

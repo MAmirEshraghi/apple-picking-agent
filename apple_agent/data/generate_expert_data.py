@@ -56,7 +56,8 @@ Process only one group:
     python -m apple_agent.data.generate_expert_data \\
         --run-id 20260504_203032 --group-key <key>
 
-Tip — defaults match the smoother “config 1” baseline (step_scale=0.3, alpha=0.55, dq_cap=0.03).
+Controller defaults: step_scale=1.4, alpha=0.55, dq_cap=0.03 (used for tree08_rank1_v2). They are saved
+with every trajectory as gen_* attrs.
 
 Experimental longer / stricter correction (optional):
 
@@ -103,6 +104,7 @@ from apple_agent.planning.common import (
     resolve_run_id,
     setup_planning_functions,
     shortcut_and_refine_path,
+    tree_urdf_relpath,
 )
 from apple_agent.data import agent_data
 from apple_agent.data.obs_spec import DEPTH_UNITS_PER_M
@@ -1016,11 +1018,24 @@ def run_group(
         "controller_mode": "continuous_physics_rollout",
         "goal_achieved_count": int(buffers["goal_achieved_count"]),
         "truncated_flag": bool(buffers["truncated_flag"]),
+        # generator settings, so each trajectory records how it was produced
+        "gen_step_scale": float(args.step_scale),
+        "gen_action_smoothing_alpha": alpha,
+        "gen_record_joint_dq_cap": dq_cap,
+        "gen_final_correction_steps": int(args.final_correction_steps),
+        "gen_final_correction_divergence_min_corr_idx": int(args.final_correction_divergence_min_corr_idx),
+        "gen_final_goal_pos_tol": float(args.final_goal_pos_tol),
+        "gen_max_transitions": int(args.max_transitions),
+        "gen_min_visibility": float(args.min_visibility),
+        "gen_max_ee_velocity": float(max_ee_vel),
+        "gen_env_action_scale": float(env.action_scale),
     }
     # exact joint angles of frame 0 (bootstrap teleport target), so replay starts from the same state
     save_info["initial_joint_angles"] = np.asarray(refined_path[0], dtype=np.float64)
 
     tree_info = {k: _hdf5_safe_attr_value(v) for k, v in metadata.items()}
+    if "tree_urdf" in metadata:  # older waypoints files hold an absolute path
+        tree_info["tree_urdf"] = tree_urdf_relpath(np.asarray(metadata["tree_urdf"]).reshape(-1)[0])
 
     robot_conf = CONFIG["robot_setup"]
     robot_pos_save = np.asarray(robot_conf["start_position"], dtype=np.float64)
@@ -1105,7 +1120,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "Batch-generate RL agent-data from a pre-planned waypoints HDF5 file "
-            "using the kinematic-step approach (teleport → obs → step → teleport → obs)."
+            "with a continuous physics rollout (one teleport to the start, then env.step only)."
         )
     )
 
@@ -1160,7 +1175,7 @@ def parse_args() -> argparse.Namespace:
     # ── controller knobs ──────────────────────────────────────────────────────
     p.add_argument(
         "--step-scale", type=float, default=1.4,
-        help="EE-velocity action scale after Jacobian conversion (default 0.3).",
+        help="EE-velocity action scale after Jacobian conversion (default 1.4).",
     )
     p.add_argument(
         "--action-smoothing-alpha", type=float, default=0.55,

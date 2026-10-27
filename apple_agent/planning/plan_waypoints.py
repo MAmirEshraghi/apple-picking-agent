@@ -1,51 +1,54 @@
+#!/usr/bin/env python3
 """
-main.py
+plan_waypoints.py  —  stage 1 of the expert-data pipeline (formerly run_apple_data_generator.py)
 
 Authors: Robin Eshraghi (@MAmirEshraghi)
+Part of an internship with Prof. Cindy Grimm, Robotics Lab, Oregon State University.
 
-This project is part of my internship under the supervision of Prof. Cindy Grimm in the Robotics Lab at the Oregon State University.
+Plans collision-free joint-space paths from the robot's start pose to a pre-grasp pose in front of
+each apple and saves them to output/waypoints/<run_id>.hdf5. Per apple:
 
-Description:
-This script implements the Apple Path Planning experiment for the
-pybullet-tree-sim environment. It performs:
+1. Sample approach orientations, solve IK for the pre-grasp pose (goal_position_offset back from the
+   apple along the tool z axis), keep FK-checked, collision-free goals.
+2. Optional goal camera filter: keep only goals where the wrist camera sees the apple.
+3. RRT (planning.planner_type: rrt_star by default, rrt_connect, rrt_star_connect) to each goal; keep
+   the best num_top_paths_to_save_per_apple paths, shortcut + task-space refine them, save each as an
+   HDF5 group (fail_mode=SUCCESS, path_rank 1..N) or one NO_PATH group when nothing was found.
 
-1. Collision-free path planning from the robot's start position
-   to a pre-grasp position near the apple using RRT-Connect.
-2. Trajectory smoothing and conversion to velocity commands.
-3. Generation of trajectory datasets for downstream RL training.
+Stage 2 (expert trajectories from these waypoints) is apple_agent/data/generate_expert_data.py.
+Shared helpers (collision checks, refinement, waypoints-HDF5 I/O) are in apple_agent/planning/common.py.
 
-Folder Structure Expected:
-- utils/ : helper functions for planning and trajectory generation
-- pybullet_tree_sim/ : core simulation environment (provided by team)
-- agent/apple_agent/ : this experiment's package (envs, planning, data, rl)
+Run from the workspace root (where output/ and logs/ live):
 
-Usage:
-- Run this script to generate data for RL training or visualize
-  the robot's approach path in the simulation.
-- Ensure PyBullet and required dependencies are installed.
+    python -m apple_agent.planning.plan_waypoints --stage planner --tree-id 8 --run_id tree08 --no-render
+    python -m apple_agent.planning.plan_waypoints --stage planner --no-render   # no --tree-id: every exported tree
+    python -m apple_agent.planning.plan_waypoints --stage visualize --run_id tree08
+    python -m apple_agent.planning.plan_waypoints --stage prewarm --tree-id 8  # build tree pkl cache
+    python -m apple_agent.planning.plan_waypoints --stage axis_test
 
-Date Started: 01/04/2025
-
-Date Completed: 01/08/2025
-
-
+Logs: logs/plan_waypoints/<timestamp>_<stage>.log (full session) and
+logs/path_planner_result/<run_id>.log (planner summary + CONFIG).
 """
-
-#!/usr/bin/env python3
-import logging
-import h5py
-import numpy as np
-import time
-import pybullet_planning as pp
-from pybullet_tree_sim import robot
-from zenlog import log
 import argparse
-from filelock import FileLock
+import datetime
 import json
-import sys
+import logging
+import os
+import random
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from apple_agent.envs.apple_picking_env import ApplePickingEnv
+import h5py
+import numpy as np
+import pybullet_planning as pp
+from filelock import FileLock
+from scipy.spatial.transform import Rotation
+from zenlog import log
+
+from pybullet_tree_sim.robot import Robot
+from pybullet_tree_sim.tree import Tree
+from pybullet_tree_sim.utils.pyb_utils import PyBUtils
 from pybullet_tree_sim.utils.tree_loading import resolve_preserve_export_mtl
 from pybullet_tree_sim.utils.viz_debug import (
     apple_marker_surface_position,
@@ -54,41 +57,22 @@ from pybullet_tree_sim.utils.viz_debug import (
     log_apple_marker_batch,
     replace_debug_sphere,
 )
+
+from apple_agent.config import CONFIG  # shared, mutated in place by the stages below
+from apple_agent.envs.apple_picking_env import ApplePickingEnv
+from apple_agent.planning.common import (
+    ResultMode,
+    ensure_output_dirs,
+    resolve_run_id,
+    setup_planning_functions,
+    shortcut_and_refine_path,
+    tree_id_str_from_config,
+    tree_urdf_relpath,
+)
 from apple_agent.planning.goal_camera_filter import (
     GoalCameraFilterDebugContext,
     evaluate_goal_camera_filter_method_a,
 )
-from apple_agent.envs.utils_conversions import (
-    convert_local_action_to_global,
-    convert_global_action_to_local,
-)
-
-
-import pybullet
-from pybullet_planning.interfaces.planner_interface.joint_motion_planning import get_sample_fn, get_extend_fn, get_distance_fn, get_difference_fn
-from pybullet_planning.motion_planners.smoothing import smooth_path
-from scipy.spatial.transform import Rotation
-import os
-import pickle
-import datetime
-import cv2
-import random
-from enum import Enum
-from dataclasses import dataclass, field
-
-import copy
-
-
-try:
-    from pybullet_tree_sim.utils.pyb_utils import PyBUtils
-    from pybullet_tree_sim.robot import Robot
-    from pybullet_tree_sim.tree import Tree
-except ImportError as e:
-    log.error(f"Failed to import necessary custom modules: {e}")
-    log.error("Please ensure pybullet_tree_sim package is installed and accessible in your PYTHONPATH.")
-    exit()
-
-from apple_agent.config import CONFIG  # noqa: E402  (shared, mutated in place by the stages below)
 
 
 @dataclass
@@ -167,12 +151,6 @@ def seed_random_generators(seed_value, label="global"):
     np.random.seed(seed_value)
     random.seed(seed_value)
     log.info(f"Seeded numpy/random for {label} with seed={seed_value}")
-
-class ResultMode(Enum):
-    NO_SOLUTION = 0
-    SUCCESS = 1
-    NO_PATH = 2
-
 
 def generate_apple_orientation_quat(apple_center_pos: np.ndarray, 
                                     max_roll_rad: float, 
@@ -273,228 +251,7 @@ def draw_debug_frame(pb_client, position, orientation_quat, length=0.1, line_wid
     pb_client.addUserDebugLine(origin, y_axis, [0, 1, 0], lineWidth=line_width)
     pb_client.addUserDebugLine(origin, z_axis, [0, 0, 1], lineWidth=line_width)
 
-def setup_planning_functions(robot: Robot, 
-                             tree_pb_id: int, 
-                             planning_config: dict, 
-                             visualization_config: dict,
-                             pb_client_ref, 
-                             tree_object_ref: Tree = None, 
-                             camera_sensor=None,
-                             metrics: PlannerStats = None):
-    
-    controllable_joints = robot.control_joint_idxs
-    robot_id = robot.robot
-    distance_fn = get_distance_fn(robot_id, controllable_joints)
-    sample_fn = get_sample_fn(robot_id, controllable_joints)
-    #extend_fn = get_extend_fn(robot_id, controllable_joints)
-    resolutions = 0.05
-    extend_fn = get_extend_fn(robot_id, controllable_joints, resolutions=resolutions)
-
-    obstacle_dict_for_robot_check = {label: tree_pb_id for label in planning_config['collision_labels']}
-    acceptable_labels = planning_config.get('acceptable_collision_labels', [])
-    unacceptable_labels = planning_config.get('unacceptable_collision_labels', [])
-    vis_check_config = planning_config.get('visibility_check', {})
-
-    def is_state_valid_fn(q):
-        current_q_robot = robot.get_joint_angles()
-        robot.set_joint_angles_no_collision(q)
-        
-        # Force PyBullet to update collision detection (from old version)
-        pb_client_ref.performCollisionDetection()
-        
-        # 1. --- Enhanced Collision Check with Fallback ---
-        is_unacceptable_collision = False
-        detailed_col_info = {}
-        
-        try:
-            # Try advanced collision checking first
-            if not hasattr(robot, 'check_collisions'):
-                raise AttributeError("Robot object does not have 'check_collisions' method.")
-                
-            is_unacceptable_collision, detailed_col_info = robot.check_collisions(
-                obstacle_dict_for_robot_check,
-                tree_object_for_labeling=tree_object_ref,
-                acceptable_labels=acceptable_labels,
-                unacceptable_labels=unacceptable_labels)
-            
-            # Check if ANY collision occurred (acceptable or unacceptable)
-            has_acceptable_collision = detailed_col_info.get("collisions_acceptable", False)
-            has_unacceptable_collision = detailed_col_info.get("collisions_unacceptable", False)
-            
-            # CORRECTED: Only invalidate state for UNACCEPTABLE collisions
-            if has_unacceptable_collision:
-                col_body = (
-                    "self"
-                    if detailed_col_info.get("is_self_collision_unacceptable")
-                    else "tree"
-                )
-                log.info(
-                    "PLAN_COLLISION reject body=%s label=%s",
-                    col_body,
-                    detailed_col_info.get("collided_obstacle_label"),
-                )
-                log.warning("State INVALID: Unacceptable collision detected.")
-                if metrics is not None:
-                    if detailed_col_info.get('is_self_collision_unacceptable', False):
-                        metrics.collision_self_rejections += 1
-                    else:
-                        metrics.collision_env_rejections += 1
-                if visualization_config.get('visualize_actual_collision_points', False):
-                    env_contact_point = detailed_col_info.get('contact_point_on_obstacle')
-                    collided_label = detailed_col_info.get('collided_obstacle_label')
-                    if env_contact_point is not None and collided_label is not None:
-                        log.debug(f"Visualizing unacceptable ENV collision with determined label '{collided_label}' at {np.round(env_contact_point, 3)}")
-                        draw_debug_sphere(pb_client_ref, env_contact_point, 
-                                        visualization_config['collision_point_radius'], 
-                                        visualization_config['collision_point_color_env'])
-                    self_contact_point = detailed_col_info.get('self_collision_contact_pos')
-                    if self_contact_point is not None and detailed_col_info.get('is_self_collision_unacceptable', False):
-                        log.debug(f"Visualizing unacceptable SELF collision at {np.round(self_contact_point, 3)}")
-                        draw_debug_sphere(pb_client_ref, self_contact_point, 
-                                        visualization_config['collision_point_radius'], 
-                                        visualization_config['collision_point_color_self'])
-                robot.set_joint_angles_no_collision(current_q_robot)
-                return True  # State is invalid
-            
-            # ACCEPTABLE collisions (like APPLE contact) are OK - continue to visibility check
-            if has_acceptable_collision:
-                log.debug(f"State has acceptable collision with: {detailed_col_info.get('collided_obstacle_label', 'UNKNOWN')}")
-                
-        except AttributeError as ae:
-            # FALLBACK: Use basic PyBullet collision detection (from old version)
-            log.warning(f"{ae}. Using generic collision check fallback for environment.")
-            
-            # Check environment collisions
-            contacts_env = pb_client_ref.getContactPoints(bodyA=robot.robot, bodyB=tree_pb_id)
-            if contacts_env:
-                for contact in contacts_env:
-                    if contact[8] < -0.001:  # Penetration threshold from old version
-                        is_unacceptable_collision = True
-                        log.info("PLAN_COLLISION reject body=tree label=generic_fallback")
-                        if visualization_config.get('visualize_actual_collision_points', False):
-                            cp = contact[6]  # Contact point on bodyB (tree)
-                            log.debug(f"Visualizing generic ENV collision at {np.round(cp, 3)} (due to AttributeError in robot.check_collisions)")
-                            draw_debug_sphere(pb_client_ref, cp,
-                                            visualization_config['collision_point_radius'],
-                                            visualization_config['collision_point_color_env'])
-                        break
-            
-            # Check self-collisions if no environment collision found
-            if not is_unacceptable_collision:
-                self_contacts = pb_client_ref.getContactPoints(bodyA=robot.robot, bodyB=robot.robot)
-                if self_contacts:
-                    for sc in self_contacts:
-                        if sc[3] != sc[4] and sc[8] < -0.015:  # Different links, deeper penetration threshold
-                            is_unacceptable_collision = True
-                            if metrics is not None:
-                                metrics.collision_self_rejections += 1
-                            if visualization_config.get('visualize_actual_collision_points', False):
-                                cp_self = sc[5]  # Contact point on bodyA (robot)
-                                log.debug(f"Visualizing generic SELF collision at {np.round(cp_self, 3)} (due to AttributeError in robot.check_collisions)")
-                                draw_debug_sphere(pb_client_ref, cp_self,
-                                                visualization_config['collision_point_radius'],
-                                                visualization_config['collision_point_color_self'])
-                            break
-            
-            # If fallback found collision, return invalid
-            if is_unacceptable_collision:
-                robot.set_joint_angles_no_collision(current_q_robot)
-                return True
-                
-        except Exception as e:
-            # Handle any other errors gracefully
-            log.error(f"Error during collision check for q={np.round(q, 3)}: {e}", exc_info=True)
-            robot.set_joint_angles_no_collision(current_q_robot)
-            return True  # Assume invalid state on error
-        
-        # 2. --- Camera-Based Visibility Check ---
-        if vis_check_config.get('enable', False) and camera_sensor is not None:
-            try:
-                view_matrix = robot.get_view_mat_at_curr_pose(camera_sensor)
-                rgb_image_float, _ = robot.get_rgbd_at_cur_pose(camera=camera_sensor, type="sensor", view_matrix=view_matrix)
-
-                rgb_image_uint8 = (np.array(rgb_image_float) * 255).astype(np.uint8)
-
-                # Support multiple target colors (e.g., red for goals, blue for active apples)
-                target_colors_rgb = vis_check_config.get('target_colors_rgb', [vis_check_config.get('target_color_rgb', (255, 0, 0))])
-                # Backward compatibility: if only single target_color_rgb is provided, convert to list
-                if 'target_color_rgb' in vis_check_config and 'target_colors_rgb' not in vis_check_config:
-                    target_colors_rgb = [vis_check_config['target_color_rgb']]
-                
-                tolerance = np.array(vis_check_config['color_tolerance'])
-                
-                # Create combined mask for all target colors
-                combined_mask = np.zeros(rgb_image_uint8.shape[:2], dtype=np.uint8)
-                for target_rgb in target_colors_rgb:
-                    target_rgb_array = np.array(target_rgb)
-                    lower_bound = np.clip(target_rgb_array - tolerance, 0, 255)
-                    upper_bound = np.clip(target_rgb_array + tolerance, 0, 255)
-                    color_mask = cv2.inRange(rgb_image_uint8, lower_bound, upper_bound)
-                    combined_mask = cv2.bitwise_or(combined_mask, color_mask)
-                
-                visible_pixels = cv2.countNonZero(combined_mask)
-
-         #       log.debug(f"Visibility check: Found {visible_pixels} target pixels.")
-
-                if visible_pixels < vis_check_config.get('min_visible_pixels', 2000):
-                    log.warning(f"State INVALID: Visibility check failed. Found {visible_pixels} pixels, need {vis_check_config.get('min_visible_pixels', 2000)}.")
-                    if metrics is not None:
-                        metrics.visibility_rejections += 1
-                    robot.set_joint_angles_no_collision(current_q_robot)
-                    return True  # State is invalid due to poor visibility
-                    
-            except Exception as e:
-                log.error(f"Error during visibility check for q={np.round(q, 3)}: {e}", exc_info=True)
-                # Continue without visibility check rather than failing completely
-                log.warning("Continuing without visibility check due to error.")
-        
-        # 3. --- If all checks pass, the state is valid ---
-        robot.set_joint_angles_no_collision(current_q_robot)
-        return False  # State is VALID
-    
-    # def is_state_valid_fn(q):
-    #     current_q_robot = robot.get_joint_angles()
-    #     robot.set_joint_angles_no_collision(q)
-    #     pb_client_ref.performCollisionDetection()
-    #     is_unacceptable_collision = False
-    #     try:
-    #         if not hasattr(robot, 'check_collisions'):
-    #             raise AttributeError("Robot object does not have 'check_collisions' method.")
-    #         is_unacceptable_collision, detailed_col_info = robot.check_collisions(obstacle_dict_for_robot_check, tree_object_for_labeling=tree_object_ref)
-    #         if is_unacceptable_collision:
-    #             log.warning("State INVALID: Unacceptable collision detected.")
-    #             if visualization_config.get('visualize_actual_collision_points', False):
-    #                 env_contact_point = detailed_col_info.get('contact_point_on_obstacle')
-    #                 if env_contact_point is not None:
-    #                     draw_debug_sphere(pb_client_ref, env_contact_point, visualization_config['collision_point_radius'], visualization_config['collision_point_color_env'])
-    #             robot.set_joint_angles_no_collision(current_q_robot)
-    #             return True
-    #     except Exception as e:
-    #         log.error(f"Error during collision check: {e}", exc_info=True)
-    #         robot.set_joint_angles_no_collision(current_q_robot)
-    #         return True
-    #     if vis_check_config.get('enable', False) and camera_sensor is not None:
-    #         try:
-    #             view_matrix = robot.get_view_mat_at_curr_pose(camera_sensor)
-    #             rgb_image_float, _ = robot.get_rgbd_at_cur_pose(camera=camera_sensor, type="sensor", view_matrix=view_matrix)
-    #             rgb_image_uint8 = (np.array(rgb_image_float) * 255).astype(np.uint8)
-    #             target_rgb, tolerance = np.array(vis_check_config['target_color_rgb']), np.array(vis_check_config['color_tolerance'])
-    #             lower_bound, upper_bound = np.clip(target_rgb - tolerance, 0, 255), np.clip(target_rgb + tolerance, 0, 255)
-    #             mask = cv2.inRange(rgb_image_uint8, lower_bound, upper_bound)
-    #             visible_pixels = cv2.countNonZero(mask)
-    #             if visible_pixels < vis_check_config.get('min_visible_pixels', 2000):
-    #                 log.warning(f"State INVALID: Visibility check failed. Found {visible_pixels} pixels.")
-    #                 robot.set_joint_angles_no_collision(current_q_robot)
-    #                 return True
-    #         except Exception as e:
-    #             log.error(f"Error during visibility check: {e}", exc_info=True)
-    #     robot.set_joint_angles_no_collision(current_q_robot)
-    #     return False
-    
-
-    return distance_fn, sample_fn, extend_fn, is_state_valid_fn
-
-def visualize_path(robot: Robot, path: list, delay: float, visualization_sensor, pb_client):
+def visualize_path(robot: Robot, path: list, delay: float):
     if not path:
         log.warning("Cannot visualize empty path.")
         return
@@ -509,104 +266,6 @@ def visualize_path(robot: Robot, path: list, delay: float, visualization_sensor,
             if CONFIG['simulation_setup']['renders']:
                 time.sleep(3)
     log.info("Path visualization complete.")
-
-
-def task_space_distance(robot, q1, q2):
-    original_q = robot.get_joint_angles()
-    robot.set_joint_angles_no_collision(q1)
-    pos1, _ = robot.get_current_pose(robot.tool0_link_idx)
-    robot.set_joint_angles_no_collision(q2)
-    pos2, _ = robot.get_current_pose(robot.tool0_link_idx)
-    robot.set_joint_angles_no_collision(original_q)
-    return np.linalg.norm(np.array(pos1) - np.array(pos2))
-def get_refine_fn_task(robot, joints, task_threshold):
-    difference_fn = get_difference_fn(robot.robot, joints)
-    def fn(q1, q2):
-        num_steps = int(np.ceil(task_space_distance(robot, q1, q2) / task_threshold))
-        if num_steps == 0:
-            yield q2
-            return
-        for i in range(num_steps + 1):
-            alpha = i / num_steps
-            yield tuple(np.array(q1) + alpha * np.array(difference_fn(q2, q1)))
-    return fn
-def refine_waypoints_in_task_space(
-    robot,
-    joints,
-    waypoints,
-    task_threshold,
-    collision_fn=None,
-    extend_fn=None,
-):
-    """Insert intermediate joint poses along each edge (task-space spacing heuristic).
-
-    If ``collision_fn(q)`` is provided, it must match ``is_state_valid_fn`` semantics:
-    return **True** if the state is **invalid** (collision / visibility fail).
-
-    Linearly interpolated refinement samples are not guaranteed collision-free even
-    when endpoints are valid. If any intermediate sample is invalid, this function
-    falls back to ``extend_fn(q1, q2)`` (collision-checked dense joint extension
-    from pybullet_planning) for that edge. If the fallback still contains invalid
-    states, raises ``RuntimeError``.
-    """
-    if not waypoints:
-        return []
-    refine_fn = get_refine_fn_task(robot, joints, task_threshold)
-    refined_path = [waypoints[0]]
-    for edge_idx, (v1, v2) in enumerate(zip(waypoints, waypoints[1:])):
-        candidates = list(refine_fn(v1, v2))[1:]
-        use_candidates = candidates
-        if collision_fn is not None and candidates:
-            invalid_flags = [bool(collision_fn(q)) for q in candidates]
-            if any(invalid_flags):
-                log.warning(
-                    "refine_waypoints_in_task_space: edge %s — %d/%d interpolated states invalid "
-                    "(linear task-space refine) — using extend_fn fallback",
-                    edge_idx,
-                    sum(invalid_flags),
-                    len(candidates),
-                )
-                if extend_fn is None:
-                    raise RuntimeError(
-                        "Task-space refinement hit invalid interpolated states but extend_fn is None"
-                    )
-                use_candidates = list(extend_fn(tuple(v1), tuple(v2)))[1:]
-                if not use_candidates:
-                    use_candidates = [tuple(v2)]
-                if any(collision_fn(q) for q in use_candidates):
-                    raise RuntimeError(
-                        "extend_fn fallback still produced invalid states on edge %s" % edge_idx
-                    )
-        elif collision_fn is not None and not candidates:
-            pass
-        refined_path.extend(use_candidates)
-    return refined_path
-
-def shortcut_and_refine_path(robot, path, extend_fn, collision_fn, task_threshold, enable_smoothing=True):
-    if len(path) < 2: 
-        log.warning("Path is too short to refine, returning as is.")
-        return path
-        
-    log.info(f"Refining path. Initial waypoints: {len(path)}")
-    
-    if enable_smoothing:
-        path = smooth_path(path, extend_fn, collision_fn, iterations=20)
-        log.info(f"Waypoints after shortcutting: {len(path)}")
-    else:
-        log.info("Skipping path smoothing per configuration.")
-    
-    # Task-space refinement (collision-check intermediates; extend_fn fallback on failure)
-    path = refine_waypoints_in_task_space(
-        robot,
-        robot.control_joint_idxs,
-        path,
-        task_threshold,
-        collision_fn=collision_fn,
-        extend_fn=extend_fn,
-    )
-    log.info(f"Waypoints after task-space refinement: {len(path)}")
-    
-    return path
 
 
 def _compute_joint_path_length(path):
@@ -721,30 +380,6 @@ def save_rrt_path_to_hdf5(save_path, env_info, fail_mode, waypoints):
     log.info(f"Saved RRT path to {save_path} under group {name}")
 
 
-def reset_robot_for_new_path(env, metadata, start_waypoints):
-        """
-        Resets the robot's joint configuration to the start of a path and
-        updates the goal without reloading the entire simulation.
-        """
-        # Set the robot's arm to the starting configuration of the path
-        start_joint_angles = start_waypoints[0]
-        env.robot.set_joint_angles_no_collision(start_joint_angles)
-
-        # Update the environment's target goal for the new path
-        env.desired_goal = metadata['apple_center']
-        env.reward_goal = metadata['goal_pos']
-        # Give pybullet a moment to update the visual state
-        #env.pb_client.stepSimulation()
-
-import time # Make sure 'time' is imported at the top of your file
-
-def tree_id_str_from_config(config: dict | None = None) -> str:
-    """PyBullet mesh id, e.g. LPy_envy_00017."""
-    cfg = config or CONFIG
-    ts = cfg["tree_setup"]
-    return f"{ts['tree_namespace']}_{ts['tree_type']}_{int(ts['tree_id']):05d}"
-
-
 def discover_available_tree_ids(tree_type: str = "envy", namespace: str = "LPy") -> list[int]:
     """All exported PyBullet tree ids in the unlabeled meshes folder (LPy_envy_000XX.obj → XX)."""
     from pybullet_tree_sim import MESHES_PATH
@@ -781,128 +416,14 @@ def apply_cli_config(args) -> None:
         ts["regenerate_urdf"] = True
 
 
-def waypoints_metadata_matches_config(attrs, config: dict | None = None) -> tuple[bool, str]:
-    """Check HDF5 path attrs were planned for the current CONFIG tree."""
-    cfg = config or CONFIG
-    expected_id = int(cfg["tree_setup"]["tree_id"])
-    expected_str = tree_id_str_from_config(cfg)
-    saved_id = attrs.get("tree_id")
-    if saved_id is not None and int(saved_id) != expected_id:
-        return False, f"tree_id {saved_id} != CONFIG {expected_id}"
-    urdf = str(attrs.get("tree_urdf", ""))
-    if urdf and expected_str not in urdf:
-        return False, f"tree_urdf missing {expected_str}: {urdf}"
-    saved_str = attrs.get("tree_id_str")
-    if saved_str is not None and str(saved_str) != expected_str:
-        return False, f"tree_id_str {saved_str} != {expected_str}"
-    scale = attrs.get("tree_scale")
-    if scale is not None and abs(float(scale) - float(cfg["tree_setup"]["scale"])) > 1e-4:
-        return False, f"tree_scale {scale} != CONFIG {cfg['tree_setup']['scale']}"
-    return True, ""
-
-
-def _waypoint_tree_signature(attrs) -> tuple[int, float] | None:
-    """(tree_id, tree_scale) from HDF5 group attrs, or None if incomplete."""
-    if attrs.get("tree_id") is None or attrs.get("tree_scale") is None:
-        return None
-    return (int(attrs["tree_id"]), float(attrs["tree_scale"]))
-
-
-def apply_tree_setup_from_waypoints_hdf5(
-    waypoints_path,
-    *,
-    config: dict | None = None,
-    ref_group_key: str | None = None,
-) -> str:
-    """
-    Patch CONFIG tree_setup from a SUCCESS group in the waypoints HDF5.
-
-    Uses *ref_group_key* when set; otherwise the first SUCCESS group.
-    Warns if SUCCESS groups disagree on tree_id / tree_scale.
-    """
-    cfg = config or CONFIG
-    ts = cfg["tree_setup"]
-    path = Path(waypoints_path)
-    with h5py.File(path, "r") as f:
-        success_keys = [
-            k for k in f.keys()
-            if int(f[k].attrs.get("fail_mode", -1)) == ResultMode.SUCCESS.value
-        ]
-        if not success_keys:
-            raise ValueError(f"No SUCCESS groups in {path}")
-
-        if ref_group_key is not None:
-            if ref_group_key not in f:
-                raise KeyError(f"group {ref_group_key!r} not in {path}")
-            ref_key = ref_group_key
-        else:
-            ref_key = success_keys[0]
-
-        ref_attrs = dict(f[ref_key].attrs)
-        ref_sig = _waypoint_tree_signature(ref_attrs)
-        if ref_sig is None:
-            raise ValueError(
-                f"Group {ref_key!r} missing tree_id/tree_scale — cannot auto-apply CONFIG"
-            )
-
-        for k in success_keys:
-            sig = _waypoint_tree_signature(dict(f[k].attrs))
-            if sig is not None and sig != ref_sig:
-                log.warning(
-                    "Waypoints HDF5 mixed tree setup: %s has tree_id=%s scale=%s "
-                    "but ref %s has tree_id=%s scale=%s — using ref group only",
-                    k, sig[0], sig[1], ref_key, ref_sig[0], ref_sig[1],
-                )
-
-    before = {
-        "tree_id": int(ts["tree_id"]),
-        "scale": float(ts["scale"]),
-        "position": np.asarray(ts["position"], dtype=np.float64).copy(),
-    }
-    ts["tree_id"] = ref_sig[0]
-    ts["scale"] = ref_sig[1]
-    if ref_attrs.get("tree_pos") is not None:
-        ts["position"] = np.asarray(ref_attrs["tree_pos"], dtype=np.float64).reshape(3)
-    if ref_attrs.get("tree_orientation") is not None:
-        ts["orientation"] = np.asarray(
-            ref_attrs["tree_orientation"], dtype=np.float64
-        ).reshape(4)
-
-    log.info(
-        "CONFIG tree_setup from HDF5 group %r: tree_id %s→%s  scale %.4f→%.4f  "
-        "pos %s→%s  id_str=%s",
-        ref_key,
-        before["tree_id"],
-        ts["tree_id"],
-        before["scale"],
-        ts["scale"],
-        np.round(before["position"], 4).tolist(),
-        np.round(np.asarray(ts["position"]), 4).tolist(),
-        ref_attrs.get("tree_id_str", tree_id_str_from_config(cfg)),
-    )
-    return ref_key
-
-
 # Planner summary text files (per-run results)
 LOG_PATH_PLANNER_RESULT_SUBDIR = "path_planner_result"
 # Full session transcript for this script (all stages)
-LOG_SESSION_SUBDIR = "data_generator_path_planner"
-
-
-def _ensure_output_dirs():
-    base_dir = Path(CONFIG['output']['base_dir'])
-    waypoints_dir = base_dir / CONFIG['output']['waypoints_subdir']
-    agent_data_dir = base_dir / CONFIG['output']['agent_data_subdir']
-    logs_dir = Path("logs")
-    planner_results_dir = logs_dir / LOG_PATH_PLANNER_RESULT_SUBDIR
-    session_logs_dir = logs_dir / LOG_SESSION_SUBDIR
-    for directory in (waypoints_dir, agent_data_dir, logs_dir, planner_results_dir, session_logs_dir):
-        directory.mkdir(parents=True, exist_ok=True)
-    return waypoints_dir, agent_data_dir, logs_dir
+LOG_SESSION_SUBDIR = "plan_waypoints"
 
 
 def _setup_session_logging(stage_label: str) -> Path:
-    """Mirror zenlog output to logs/data_generator_path_planner/<timestamp>_<stage>.log"""
+    """Mirror zenlog output to logs/plan_waypoints/<timestamp>_<stage>.log"""
     base = Path("logs") / LOG_SESSION_SUBDIR
     base.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -919,20 +440,6 @@ def _setup_session_logging(stage_label: str) -> Path:
     return log_path
 
 
-def _resolve_run_id(run_id, directory, should_exist=True):
-    directory.mkdir(parents=True, exist_ok=True)
-    if run_id:
-        target_file = directory / f"{run_id}.hdf5"
-        if should_exist and not target_file.exists():
-            raise FileNotFoundError(f"Run ID '{run_id}' not found in {directory}.")
-        return run_id, target_file
-    existing_files = sorted(directory.glob("*.hdf5"))
-    if not existing_files:
-        raise FileNotFoundError(f"No run outputs found in {directory}.")
-    latest_file = existing_files[-1]
-    return latest_file.stem, latest_file
-
-
 def run_visualization_stage(run_id=None):
     """
     Loads saved waypoint paths and visualizes them in the PyBullet GUI
@@ -942,9 +449,9 @@ def run_visualization_stage(run_id=None):
     log.info("V_DATAGEN: STAGE 3 - VISUALIZE SAVED PATHS")
     log.info("="*60)
 
-    waypoints_dir, _, _ = _ensure_output_dirs()
+    waypoints_dir, _, _ = ensure_output_dirs()
     try:
-        run_id, waypoints_path = _resolve_run_id(run_id, waypoints_dir, should_exist=True)
+        run_id, waypoints_path = resolve_run_id(run_id, waypoints_dir, should_exist=True)
     except FileNotFoundError as exc:
         log.error(str(exc))
         return
@@ -1074,7 +581,7 @@ def run_planner_stage(num_apples_to_plan, run_id=None):
         CONFIG["tree_setup"].get("apply_texture", True),
         resolve_preserve_export_mtl(CONFIG["tree_setup"]),
     )
-    waypoints_dir, _, logs_dir = _ensure_output_dirs()
+    waypoints_dir, _, logs_dir = ensure_output_dirs()
     if run_id is None:
         run_id = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     CONFIG['output']['waypoints_hdf5_path'] = str((waypoints_dir / f"{run_id}.hdf5").resolve())
@@ -1378,26 +885,24 @@ def run_planner_stage(num_apples_to_plan, run_id=None):
         joint_path_length = None
         smoothness_cost = None
         failure_reason = None
+        saved_paths = []  # one per top path, refined once: the same waypoints go to stats and HDF5
 
         if path_found:
-            best = top_paths[0]
-            best_pick = best["pick_tuple"]
-            if save_refined:
-                best_refined = shortcut_and_refine_path(
-                    robot,
-                    list(best["path_waypoints"]),
-                    extend_fn,
-                    is_state_valid_fn,
-                    planning_cfg['task_space_refinement_threshold'],
-                    enable_smoothing=planning_cfg.get('enable_smoothing', True),
-                )
-                waypoint_count = len(best_refined)
-                joint_path_length = _compute_joint_path_length(best_refined)
-                smoothness_cost = _compute_smoothness_cost(best_refined)
-            else:
-                waypoint_count = len(best["path_waypoints"])
-                joint_path_length = _compute_joint_path_length(best["path_waypoints"])
-                smoothness_cost = _compute_smoothness_cost(best["path_waypoints"])
+            for candidate in top_paths:
+                if save_refined:
+                    saved_paths.append(shortcut_and_refine_path(
+                        robot,
+                        list(candidate["path_waypoints"]),
+                        extend_fn,
+                        is_state_valid_fn,
+                        planning_cfg['task_space_refinement_threshold'],
+                        enable_smoothing=planning_cfg.get('enable_smoothing', True),
+                    ))
+                else:
+                    saved_paths.append(list(candidate["path_waypoints"]))
+            waypoint_count = len(saved_paths[0])
+            joint_path_length = _compute_joint_path_length(saved_paths[0])
+            smoothness_cost = _compute_smoothness_cost(saved_paths[0])
         else:
             if apply_rrt_cap and ik_attempts > 0 and filtered_rrt_count == 0:
                 failure_reason = "All IK candidates failed goal camera filter"
@@ -1418,26 +923,14 @@ def run_planner_stage(num_apples_to_plan, run_id=None):
                 len(top_paths),
                 max_top_paths,
             )
-            for rank, candidate in enumerate(top_paths, start=1):
-                raw_path = candidate["path_waypoints"]
-                raw_wp_n = len(raw_path)
+            for rank, (candidate, refined_for_save) in enumerate(zip(top_paths, saved_paths), start=1):
+                raw_wp_n = len(candidate["path_waypoints"])
                 pick_tuple_log = candidate["pick_tuple"]
-                if save_refined:
-                    refined_for_save = shortcut_and_refine_path(
-                        robot,
-                        list(raw_path),
-                        extend_fn,
-                        is_state_valid_fn,
-                        planning_cfg['task_space_refinement_threshold'],
-                        enable_smoothing=planning_cfg.get('enable_smoothing', True),
-                    )
-                else:
-                    refined_for_save = list(raw_path)
 
                 env_info = {
                     'tree_id': int(tree.tree_id),
                     'tree_id_str': tree.id_str,
-                    'tree_urdf': tree.urdf_path, 'tree_pos': tree.pos, 'tree_orientation': tree.orientation,
+                    'tree_urdf': tree_urdf_relpath(tree.urdf_path), 'tree_pos': tree.pos, 'tree_orientation': tree.orientation,
                     'tree_scale': tree.scale, 'robot_pos': robot_pos, 'robot_or': robot_or,
                     'apple_center': np.array(apple_center),
                     'apple_index': int(i + 1),
@@ -1463,8 +956,6 @@ def run_planner_stage(num_apples_to_plan, run_id=None):
                         robot,
                         refined_for_save,
                         CONFIG['visualization']['path_visualization_delay'],
-                        camera_sensor_obj,
-                        pb_client,
                     )
                 log.info(
                     "PLAN_SAVE_SUMMARY  apple=%d/%d  rank=%d/%d  raw_wp=%d  saved_wp=%d  refined=%s  "
@@ -1522,15 +1013,6 @@ def run_planner_stage(num_apples_to_plan, run_id=None):
     log.info("Planner stage complete.")
     env.close()
 
-def run_generator_stage(run_id=None):
-    """Removed: the legacy stage-2 writer produced inconsistent observations (prev_rgb == rgb,
-    mis-scaled cached flow). Use the schema-v2 generator instead."""
-    log.error(
-        "--stage generator was removed. Run: python -m apple_agent.data."
-        "generate_expert_data --run-id %s", run_id or "<run_id>",
-    )
-    sys.exit(2)
-
 def run_axis_test():
     """
     This function helps diagnose coordinate frame issues by commanding
@@ -1579,8 +1061,9 @@ def run_axis_test():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Apple Picking Data Generation Pipeline")
-    parser.add_argument('--stage', type=str, required=False, choices=['prewarm', 'planner', 'generator', 'visualize', 'axis_test'], help="Which stage of the pipeline to run.")
+    parser = argparse.ArgumentParser(
+        description="Plan RRT waypoints to each apple (stage 1). Expert data: python -m apple_agent.data.generate_expert_data")
+    parser.add_argument('--stage', type=str, required=False, choices=['prewarm', 'planner', 'visualize', 'axis_test'], help="Which stage to run.")
     parser.add_argument('--num_apples', type=int, default=0, help="Number of apples to plan for in the planner stage (<=0 for all).")
     parser.add_argument('--planner_type', type=str, choices=['rrt_connect', 'rrt_star', 'rrt_star_connect'], help="Planner to use in planner stage.")
     parser.add_argument('--visualize_planning', action='store_true', help="Visualize the saved RRT paths without generating data.")
@@ -1605,8 +1088,6 @@ if __name__ == "__main__":
         _stage_label = "prewarm"
     elif args.stage == "planner":
         _stage_label = "planner"
-    elif args.stage == "generator":
-        _stage_label = "generator"
     if _stage_label is not None:
         _session_log_path = _setup_session_logging(_stage_label)
         log.info(f"Session log (full run output): {_session_log_path}")
@@ -1640,7 +1121,5 @@ if __name__ == "__main__":
                     run_planner_stage(args.num_apples, per_run_id)
         else:
             run_planner_stage(args.num_apples, args.run_id)
-    elif args.stage == 'generator':
-        run_generator_stage(args.run_id)
     elif args.stage is None:
         parser.print_help()

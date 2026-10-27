@@ -5,7 +5,7 @@ simulated trees. The robot, tree and sensor simulation comes from the separate s
 `pybullet_tree_sim`, developed in the fork
 [MAmirEshraghi/UR5-ApplePathPlanning-Sim-PyBullet](https://github.com/MAmirEshraghi/UR5-ApplePathPlanning-Sim-PyBullet).
 
-**Pipeline:** RRT-Connect planner → waypoints → closed-loop expert rollouts → validated HDF5 dataset →
+**Pipeline:** RRT planner → waypoints → closed-loop expert rollouts → validated HDF5 dataset →
 BC / PPO+BC training → evaluation in simulation.
 
 ---
@@ -66,10 +66,12 @@ data can be reused with a symlink, e.g. `ln -s /path/to/old/output output`.
 
 ### 4.1 Plan waypoints (stage 1)
 ```bash
-python -m apple_agent.planning.run_apple_data_generator --stage planner --tree-id 8 --run_id tree08 --no-render
+python -m apple_agent.planning.plan_waypoints --stage planner --tree-id 8 --run_id tree08 --no-render
 ```
-This writes collision-free RRT-Connect paths to the pre-grasp pose of each apple into `output/waypoints/tree08.hdf5`.
-Add `--visualize_planning` to replay saved paths in the GUI.
+This writes collision-free RRT paths (`planning.planner_type`, RRT* by default) to the pre-grasp pose of each
+apple into `output/waypoints/tree08.hdf5`. Without `--tree-id` it plans every exported tree (`tree00`, `tree01`, …).
+`--stage visualize --run_id tree08` replays saved paths in the GUI. Logs: `logs/plan_waypoints/` and
+`logs/path_planner_result/<run_id>.log`.
 
 ### 4.2 Generate expert data (stage 2)
 ```bash
@@ -136,7 +138,7 @@ final distance to the target. `--max_steps 150` is about 1.3× the longest exper
 |---|---|
 | `apple_agent/config.py` | Shared `CONFIG`: simulation, robot, tree, planning, generator and output settings |
 | `apple_agent/envs/` | `ApplePickingEnv` (Gymnasium) and tool/world frame conversions |
-| `apple_agent/planning/` | RRT-Connect planner (stage 1), goal camera filter |
+| `apple_agent/planning/` | `plan_waypoints` (RRT planner, stage 1), `common` (collision checks, path refinement, waypoints-HDF5 helpers shared with the generator and training), goal camera filter |
 | `apple_agent/data/` | `agent_data` (schema v2 I/O), `obs_spec`, `generate_expert_data`, `validate_agent_data`, `merge_agent_data` |
 | `apple_agent/rl/` | Train / eval / replay entry points; `debug/` diagnostics |
 | `apple_agent/apple_picking_sb3/` | SB3 PPO+BC with LSTM policy (`algo/PPOLSTMAE`), encoder, optical flow, callbacks (`apple_gym/`) |
@@ -197,12 +199,12 @@ Trained only on 4 trajectories.
 
 ## Script Description: 
 
-### 1: ```apple_agent/planning/run_apple_data_generator.py``` 
+### 1: ```apple_agent/planning/plan_waypoints.py``` (formerly run_apple_data_generator.py)
 This is the main executable script for the data generation pipeline. It uses command-line arguments to run different stages of the process, including:
 
 - Planner (Stage 1): Loads the simulation, finds apples, and uses RRT-Connect to plan collision-free paths to them, saving the paths to ```rrt_paths.hdf5```.
 
-- Generator (Stage 2): moved to ```apple_agent/data/generate_expert_data.py``` (see Stage 2 below); `--stage generator` now exits with that pointer.
+- Generator (Stage 2): ```apple_agent/data/generate_expert_data.py``` (see Stage 2 below); the old `--stage generator` was removed.
 
 - Visualization: Loads and replays the saved RRT paths in the PyBullet GUI for visual inspection.
 
@@ -220,13 +222,13 @@ This script defines the ```Tree``` class used in the simulation. It is responsib
 #### 5: ```pybullet_tree_sim/robot.py``` (simulator dependency): 
 This script defines the core ```Robot``` class. It is responsible for loading the robot arm model (from ```.xacro``` and config files) into the simulation. It provides the essential API for robot control, such as setting joint velocities (```set_joint_velocities```), calculating inverse kinematics (```calculate_ik```), and getting sensor data (like camera images from ``get_rgbd_at_cur_pose``). It also contains critical modified functions for the project, including a sophisticated ```check_collisions``` method that uses a K-D tree to identify the label of a collided point (e.g., "TRUNK" vs. "APPLE").
 
-## How to Use ```run_apple_data_generator.py```:
+## How to Use ```plan_waypoints.py```:
 
 ### Stage 1: Run the Path Planner 
 This stage loads the environment and uses the RRT-Connect algorithm to find collision-free joint-space paths from the robot's start position to a pre-grasp pose near each apple. These paths are saved to ```rrt_paths.hdf5```
 
 ```
-python -m apple_agent.planning.run_apple_data_generator --stage planner
+python -m apple_agent.planning.plan_waypoints --stage planner
 ```
 ### Stage 2: Run the Data Generator 
 Loads the planner waypoints (`output/waypoints/<run_id>.hdf5`), refines them and executes them with a closed-loop Jacobian controller in `ApplePickingEnv` (DIRECT mode, same renderer as training). Each trajectory is saved in agent-data schema v2 (`apple_agent/data/agent_data.py`): every frame once (rgb, depth in mm, apple mask, proprio, `pregrasp_in_tool`), plus actions, rewards and env terminal/truncated flags. Then validate the file before training:
@@ -243,12 +245,12 @@ Training picks the policy's image inputs from the same data: `python -m apple_ag
 ### 1: Visualize Saved Paths 
 If you want to visually inspect the paths generated by the planner stage without generating new agent data, use this command. It loads rrt_paths.hdf5 and plays back the robot's movement in the GUI.
 ```
-python -m apple_agent.planning.run_apple_data_generator --visualize_planning
+python -m apple_agent.planning.plan_waypoints --visualize_planning
 ```
 ### 2: Run Coordinate Frame Axis Test 
 This is a debugging tool to check that the robot's coordinate frames are set up correctly. It loads the robot and commands a simple movement along its local X-axis (the red line). This helps verify that "move forward" in the tool's frame translates to the correct motion in the simulation.
 ```
-python -m apple_agent.planning.run_apple_data_generator --stage axis_test
+python -m apple_agent.planning.plan_waypoints --stage axis_test
 ```
 
 ## Setup and running
@@ -270,7 +272,7 @@ installed read-only (not editable), point `PYBULLET_TREE_SIM_DATA` at a folder w
 
 ```bash
 # run from the workspace root (where output/, logs/ and runs/ are created)
-python -m apple_agent.planning.run_apple_data_generator --stage planner      # RRT waypoints -> output/waypoints/
+python -m apple_agent.planning.plan_waypoints --stage planner      # RRT waypoints -> output/waypoints/
 python -m apple_agent.data.generate_expert_data --run-id tree08 --out-id tree08_v2
 python -m apple_agent.data.validate_agent_data --run-id tree08_v2 --policy-smoke --replay 2
 python -m apple_agent.rl.train_apple_picking_expert --run_id tree08_v2 --run_name <name> --image_channels depth,mask

@@ -16,7 +16,7 @@ from apple_agent.config import CONFIG as APPLE_PICKING_CONFIG, TRAIN_CONFIG
 from apple_agent.envs.apple_picking_env import ApplePickingEnv
 from apple_agent.data import agent_data
 from apple_agent.data.obs_spec import parse_image_channels
-from apple_agent.planning.run_apple_data_generator import (
+from apple_agent.planning.common import (
     apply_tree_setup_from_waypoints_hdf5,
     tree_id_str_from_config,
 )

@@ -71,7 +71,7 @@ Check what was saved:
         --run-id 20260504_203032 --verify-hdf5
 
 Log is written to:
-    logs/data_generator_path_planner/<timestamp>_agent_data_gen.log
+    logs/generate_expert_data/<timestamp>_agent_data_gen.log
 """
 
 from __future__ import annotations
@@ -79,7 +79,6 @@ from __future__ import annotations
 import argparse
 import atexit
 import datetime
-import importlib.util
 import io
 import logging
 import os
@@ -95,8 +94,16 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 from zenlog import log
 
-from apple_agent.planning import run_apple_data_generator as dg  # CONFIG, planning helpers
+from apple_agent.config import CONFIG
 from apple_agent.envs.apple_picking_env import ApplePickingEnv
+from apple_agent.planning.common import (
+    ResultMode,
+    apply_tree_setup_from_waypoints_hdf5,
+    ensure_output_dirs,
+    resolve_run_id,
+    setup_planning_functions,
+    shortcut_and_refine_path,
+)
 from apple_agent.data import agent_data
 from apple_agent.data.obs_spec import DEPTH_UNITS_PER_M
 from apple_agent.envs.utils_conversions import convert_global_action_to_local
@@ -106,6 +113,8 @@ from apple_agent.envs.utils_conversions import convert_global_action_to_local
 # Logging
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Session logs: logs/<LOG_SESSION_SUBDIR>/<timestamp>_agent_data_gen.log (planner logs are in logs/plan_waypoints/)
+LOG_SESSION_SUBDIR = "generate_expert_data"
 
 # Matches all ANSI/VT100 escape sequences (colors, cursor moves, etc.)
 _ANSI_ESC_RE = re.compile(rb"\x1b\[[0-9;]*[A-Za-z]")
@@ -175,7 +184,7 @@ def setup_logging(debug: bool = False) -> Path:
     Default log level: INFO (suppresses per-step env DEBUG spam).
     Use --debug-log for full DEBUG output.
     """
-    base = Path("logs") / dg.LOG_SESSION_SUBDIR
+    base = Path("logs") / LOG_SESSION_SUBDIR
     base.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = (base / f"{ts}_agent_data_gen.log").resolve()
@@ -813,13 +822,13 @@ def run_group(
 
     if not terminated and not truncated and max_corr > 0:
         goal_pos = np.asarray(metadata["goal_pos"], dtype=np.float64)
-        control_time = float(dg.CONFIG["simulation_setup"]["control_time"])
+        control_time = float(CONFIG["simulation_setup"]["control_time"])
 
         # Starting error for the correction pass
         _ee0, _ = env.robot.get_current_pose(env.robot.tool0_link_idx)
         corr_start_err = float(np.linalg.norm(goal_pos - np.asarray(_ee0)))
 
-        env_goal_tol = float(dg.CONFIG['planning'].get('fk_pos_tolerance', 0.05))
+        env_goal_tol = float(CONFIG['planning'].get('fk_pos_tolerance', 0.05))
         max_corr_radius = max(env_goal_tol, float(args.final_goal_pos_tol)) * 5.0
 
         if corr_start_err > max_corr_radius:
@@ -1013,7 +1022,7 @@ def run_group(
 
     tree_info = {k: _hdf5_safe_attr_value(v) for k, v in metadata.items()}
 
-    robot_conf = dg.CONFIG["robot_setup"]
+    robot_conf = CONFIG["robot_setup"]
     robot_pos_save = np.asarray(robot_conf["start_position"], dtype=np.float64)
     robot_or_save = Rotation.from_euler(
         "xyz", robot_conf["start_orientation_euler_deg"], degrees=True
@@ -1177,7 +1186,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--final-goal-pos-tol",
         type=float,
-        default=float(dg.CONFIG["planning"].get("fk_pos_tolerance", 0.05)),
+        default=float(CONFIG["planning"].get("fk_pos_tolerance", 0.05)),
         help=(
             "Stop correction once EE-to-goal distance <= this (metres). "
             "Default matches CONFIG planning fk_pos_tolerance so env goal threshold aligns."
@@ -1208,8 +1217,8 @@ def main() -> None:
     args = parse_args()
     setup_logging(debug=args.debug_log)
 
-    waypoints_dir, agent_data_dir, _ = dg._ensure_output_dirs()
-    run_id, waypoints_path = dg._resolve_run_id(args.run_id, waypoints_dir, should_exist=True)
+    waypoints_dir, agent_data_dir, _ = ensure_output_dirs()
+    run_id, waypoints_path = resolve_run_id(args.run_id, waypoints_dir, should_exist=True)
     agent_data_path = (agent_data_dir / f"{args.out_id or run_id}.hdf5").resolve()
 
     log.info(
@@ -1218,7 +1227,7 @@ def main() -> None:
     )
 
     try:
-        dg.apply_tree_setup_from_waypoints_hdf5(
+        apply_tree_setup_from_waypoints_hdf5(
             waypoints_path, ref_group_key=args.group_key
         )
     except (ValueError, KeyError, OSError) as exc:
@@ -1241,7 +1250,7 @@ def main() -> None:
         all_keys = sort_group_keys(list(f.keys()))
         success_keys = [
             k for k in all_keys
-            if int(f[k].attrs.get("fail_mode", -1)) == dg.ResultMode.SUCCESS.value
+            if int(f[k].attrs.get("fail_mode", -1)) == ResultMode.SUCCESS.value
             and (args.path_rank <= 0 or int(f[k].attrs.get("path_rank", 1)) == args.path_rank)
         ]
 
@@ -1275,9 +1284,9 @@ def main() -> None:
     )
 
     # ── build env once ────────────────────────────────────────────────────────
-    dg.CONFIG["simulation_setup"]["renders"] = bool(args.renders)
-    dg.CONFIG["simulation_setup"]["draw_apple_centroid_markers"] = True  # env draws them only in GUI
-    env = ApplePickingEnv(config=dg.CONFIG)
+    CONFIG["simulation_setup"]["renders"] = bool(args.renders)
+    CONFIG["simulation_setup"]["draw_apple_centroid_markers"] = True  # env draws them only in GUI
+    env = ApplePickingEnv(config=CONFIG)
     if bool(env.robot.robot_conf.get("disable_self_collisions", False)):
         log.warning(
             "Sanity: robot.yaml has disable_self_collisions=true — PyBullet often "
@@ -1285,10 +1294,10 @@ def main() -> None:
             "NOT flag self-collision even if links visually intersect. "
             "Environmental (tree) collisions still use the tree body checks."
         )
-    control_freq = 1.0 / dg.CONFIG["simulation_setup"]["control_time"]
-    max_ee_vel = dg.CONFIG["planning"]["max_ee_velocity"]
+    control_freq = 1.0 / CONFIG["simulation_setup"]["control_time"]
+    max_ee_vel = CONFIG["planning"]["max_ee_velocity"]
     planner_start = np.asarray(
-        dg.CONFIG["robot_setup"]["start_joint_angles"], dtype=np.float64
+        CONFIG["robot_setup"]["start_joint_angles"], dtype=np.float64
     )
 
     log.info(
@@ -1297,11 +1306,11 @@ def main() -> None:
     )
 
     # ── build planning functions once (needed for path refinement) ────────────
-    _, _, extend_fn, collision_fn = dg.setup_planning_functions(
+    _, _, extend_fn, collision_fn = setup_planning_functions(
         env.robot,
         env.tree.pyb_id,
-        dg.CONFIG["planning"],
-        dg.CONFIG["visualization"],
+        CONFIG["planning"],
+        CONFIG["visualization"],
         env.pb_client,
         env.tree,
     )
@@ -1331,15 +1340,15 @@ def main() -> None:
 
         # refine path (skip second smooth_path if planner already saved refined waypoints)
         try:
-            _do_smooth = dg.CONFIG["planning"].get("enable_smoothing", True)
+            _do_smooth = CONFIG["planning"].get("enable_smoothing", True)
             if already_refined:
                 _do_smooth = False
-            refined_path = dg.shortcut_and_refine_path(
+            refined_path = shortcut_and_refine_path(
                 env.robot,
                 waypoints.tolist(),
                 extend_fn,
                 collision_fn,
-                dg.CONFIG["planning"]["task_space_refinement_threshold"],
+                CONFIG["planning"]["task_space_refinement_threshold"],
                 enable_smoothing=_do_smooth,
             )
         except Exception as exc:

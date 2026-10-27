@@ -112,6 +112,14 @@ python -m apple_agent.rl.train_apple_picking_expert --run_id tree08_v2 --run_nam
 - `--total_timesteps` counts environment steps (when resuming: steps added). One PPO update every 512 steps.
 - Checkpoints go to `logs/<run_name>/` and TensorBoard to `runs/<run_name>`.
 - Training needs about 2–3 GB of RAM for depth+mask buffers (more with flow).
+- **Settings** (flow size, RAFT iterations, cache, PPO and network hyper-parameters, image size) are in
+  `TRAIN_CONFIG` in `apple_agent/config.py`. `--flow_size` / `--flow_updates` override the flow ones for one run;
+  they are saved in the checkpoint, so eval and resumed runs use the same flow.
+- **Flow speed:** RAFT runs at `flow.size` (128 by default, its minimum) and the flow is resized to the CNN size.
+  Precompute it once per dataset with `python -m apple_agent.data.cache_flow --run-id tree08_rank1_v2`
+  (writes `output/flow_cache/`, checks the result against live RAFT); training then only runs RAFT on frames
+  it has not seen. Entries are keyed by image content, so a stale cache can only miss. Run it again with the
+  same `--flow_size` / `--flow_updates` you train with. Training prints `[train:flow] cache hits=… misses=…`.
 
 ### 4.5 Evaluate and inspect
 ```bash

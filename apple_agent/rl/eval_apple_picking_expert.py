@@ -16,7 +16,7 @@ import numpy as np
 
 
 from apple_agent.envs.apple_picking_env import ApplePickingEnv
-from apple_agent.config import CONFIG as APPLE_PICKING_CONFIG
+from apple_agent.config import CONFIG as APPLE_PICKING_CONFIG, TRAIN_CONFIG
 from apple_agent.data import agent_data
 from apple_agent.apple_picking_sb3.algo.PPOLSTMAE.ppo_recurrent_ae import RecurrentPPOAEWithExpert
 from stable_baselines3.common.env_util import make_vec_env
@@ -280,9 +280,9 @@ def main() -> None:
         use_online_bc=True,
         use_awac=False,
         path_trajectories=expert_hdf5,
-        algo_size=(224, 224),
+        algo_size=TRAIN_CONFIG["algo_size"],
         bc_only=False,
-        device="cuda",
+        device=TRAIN_CONFIG["device"],
     )
     model.policy.set_training_mode(False)
 

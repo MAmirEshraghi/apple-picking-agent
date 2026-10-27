@@ -12,7 +12,7 @@ from pathlib import Path
 import psutil
 
 # --- Imports from Apple Picking Project ---
-from apple_agent.config import CONFIG as APPLE_PICKING_CONFIG
+from apple_agent.config import CONFIG as APPLE_PICKING_CONFIG, TRAIN_CONFIG
 from apple_agent.envs.apple_picking_env import ApplePickingEnv
 from apple_agent.data import agent_data
 from apple_agent.data.obs_spec import parse_image_channels
@@ -696,6 +696,29 @@ if __name__ == "__main__":
              "(default: depth,mask). Must match the checkpoint when resuming.",
     )
     parser.add_argument(
+        "--flow_size",
+        type=int,
+        default=None,
+        help="RAFT input size (square, multiple of 8) for the flow channel. Default: config TRAIN_CONFIG['flow']['size']. "
+             "Ignored when resuming (the checkpoint's value is kept).",
+    )
+    parser.add_argument(
+        "--flow_updates",
+        type=int,
+        default=None,
+        help="RAFT refinement iterations for the flow channel. Default: config TRAIN_CONFIG['flow']['num_flow_updates'].",
+    )
+    # PPO trial overrides (default: TRAIN_CONFIG values / the checkpoint's own)
+    parser.add_argument("--seed", type=int, default=None, help="Random seed (torch, numpy, random, action space).")
+    parser.add_argument("--init_std", type=float, default=None,
+                        help="Set the policy's exploration std to this value at start (also when resuming).")
+    parser.add_argument("--lr_scale", type=float, default=1.0,
+                        help="Multiply all three learning rates of TRAIN_CONFIG['ppo'] (actor/critic, encoder, std).")
+    parser.add_argument("--batch_size", type=int, default=None, help="Minibatch size (default: TRAIN_CONFIG).")
+    parser.add_argument("--ent_coef", type=float, default=None, help="Entropy coefficient after warm-up (default: TRAIN_CONFIG).")
+    parser.add_argument("--max_episode_steps", type=int, default=None,
+                        help="Training episode length cap (default: CONFIG simulation_setup max_steps).")
+    parser.add_argument(
         "--renders",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -747,6 +770,7 @@ if __name__ == "__main__":
                 "renders": args.renders,
                 "draw_apple_centroid_markers": True,
                 "terminate_on_self_collision": True,  # was False — align with expert data gen default
+                **({"max_steps": args.max_episode_steps} if args.max_episode_steps else {}),
             },
         }
         _apply_tree_setup_for_training(training_config, args.run_id, expert_data_path)
@@ -775,7 +799,7 @@ if __name__ == "__main__":
             bc_coeff_warmup=args.bc_coeff_warmup,
             bc_coeff_after=args.bc_coeff,
             ent_coef_warmup=args.ent_coef_warmup,
-            ent_coef_after=0.001,
+            ent_coef_after=TRAIN_CONFIG["ppo"]["ent_coef"] if args.ent_coef is None else args.ent_coef,
             verbose=1,
         )
         imitation_callback = ApplePickingImitationCallback(
@@ -800,36 +824,41 @@ if __name__ == "__main__":
             )
 
         # --- Policy and Model Setup ---
+        pol_cfg, flow_cfg = TRAIN_CONFIG["policy"], TRAIN_CONFIG["flow"]
+        flow_size = (args.flow_size, args.flow_size) if args.flow_size else tuple(flow_cfg["size"])
         policy_kwargs = {
             'features_extractor_class': Encoder,
-            'features_extractor_kwargs': dict(size=(240, 424)),  # in_channels derived from image_channels
-            'net_arch': dict(pi=[128], vf=[128]),  # Reduce from 64 to 32 (50% less memory)
+            'features_extractor_kwargs': dict(size=pol_cfg["features_extractor_size"]),  # in_channels derived from image_channels
+            'net_arch': pol_cfg["net_arch"],
             'activation_fn': th.nn.ReLU,
-            'lstm_hidden_size': 128,  # Reduce from 256 to 128 (50% less memory)
-            'enable_critic_lstm': True,
+            'lstm_hidden_size': pol_cfg["lstm_hidden_size"],
+            'enable_critic_lstm': pol_cfg["enable_critic_lstm"],
             'image_channels': image_channels,
-            'squash_output': True,  # Force actions to be in [-1, 1] range using tanh
-            'log_std_init': -1.5,  # was 0.0 (std≈1.0) — closer to expert Jacobian action scale
+            'squash_output': pol_cfg["squash_output"],
+            'log_std_init': pol_cfg["log_std_init"],
+            # saved with the checkpoint, so eval and resumed runs use the same flow
+            **({'flow_size': flow_size, 'flow_num_updates': args.flow_updates or flow_cfg["num_flow_updates"]}
+               if "flow" in image_channels else {}),
         }
 
         train_kwargs = dict(
-            learning_rate=1e-4,
-            n_steps=512,
-            batch_size=16,
-            n_epochs=2,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=0.001,  # #tier1-30k: overridden to 0 during bc_warmup_steps via BcWarmupCallback
-            vf_coef=0.25,
-            max_grad_norm=0.5,
+            **TRAIN_CONFIG["ppo"],  # ent_coef is overridden to 0 during bc_warmup_steps via BcWarmupCallback
             use_online_data=False,
             use_offline_data=False,
             use_ppo_offline=False,
             use_online_bc=True,
             use_awac=False,
-            device="cuda",
+            device=TRAIN_CONFIG["device"],
         )
+        for k in ("learning_rate", "learning_rate_ae", "learning_rate_logstd"):
+            train_kwargs[k] *= args.lr_scale
+        if args.batch_size:
+            train_kwargs["batch_size"] = args.batch_size
+        if args.ent_coef is not None:
+            train_kwargs["ent_coef"] = args.ent_coef
+        # applied on resume too, so a run's settings come from this script, not from the checkpoint
+        resume_overrides = {k: train_kwargs[k] for k in
+                            ("learning_rate", "learning_rate_ae", "learning_rate_logstd", "batch_size")}
         expert_path = os.path.abspath(expert_data_filepath)
         load_flags = dict(
             use_online_data=False,
@@ -838,16 +867,16 @@ if __name__ == "__main__":
             use_online_bc=True,
             use_awac=False,
             path_trajectories=expert_path,
-            algo_size=(224, 224),
+            algo_size=TRAIN_CONFIG["algo_size"],
             bc_only=args.bc_only,
-            device="cuda",
+            device=TRAIN_CONFIG["device"],
         )
         if resuming:
             load_path = Path(args.load_checkpoint).resolve()
             if not load_path.is_file():
                 raise FileNotFoundError(f"Checkpoint not found: {load_path}")
             print(f"INFO: Resuming from checkpoint {load_path} (t={load_path.stem})…", flush=True)
-            model = RecurrentPPOAEWithExpert.load(str(load_path), env=env, **load_flags)
+            model = RecurrentPPOAEWithExpert.load(str(load_path), env=env, **load_flags, **resume_overrides)
             model.bc_only = args.bc_only
             if args.bc_only:
                 model.collect_online_data = False
@@ -884,7 +913,7 @@ if __name__ == "__main__":
                 env=env,
                 path_trajectories=expert_path,
                 bc_coeff=args.bc_coeff_warmup,  # #tier1-30k: warmup starts high; callback holds until bc_warmup_steps
-                algo_size=(224, 224),
+                algo_size=TRAIN_CONFIG["algo_size"],
                 policy_kwargs=policy_kwargs,
                 verbose=1,
                 tensorboard_log=f"./runs/{run_name}",
@@ -892,6 +921,19 @@ if __name__ == "__main__":
                 **train_kwargs,
             )
             model.ent_coef = args.ent_coef_warmup
+
+        if args.seed is not None:
+            model.set_random_seed(args.seed)
+        if args.init_std is not None:
+            with th.no_grad():
+                model.policy.log_std.fill_(float(np.log(args.init_std)))
+        print(
+            f"[train:config] overrides seed={args.seed} init_std={args.init_std} lr_scale={args.lr_scale} "
+            f"learning_rate_ae={train_kwargs['learning_rate_ae']} batch_size={train_kwargs['batch_size']} "
+            f"ent_coef={train_kwargs['ent_coef']} max_episode_steps={training_config['simulation_setup']['max_steps']} "
+            f"std={model.policy.log_std.exp().mean().item():.3f}",
+            flush=True,
+        )
 
         model.set_logger(new_logger)
         if args.memory_debug:
@@ -924,6 +966,11 @@ if __name__ == "__main__":
             progress_bar=args.progress_bar,
             reset_num_timesteps=not resuming,
         )
+
+        flow_cache = getattr(getattr(model.policy, "optical_flow_model", None), "cache", None)
+        if flow_cache is not None:
+            print(f"[train:flow] cache hits={flow_cache.hits} misses={flow_cache.misses} "
+                  f"(precomputed={len(flow_cache.fixed)} runtime={len(flow_cache.runtime)})", flush=True)
 
         if args.memory_debug:
             print("=" * 60)

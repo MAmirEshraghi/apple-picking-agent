@@ -34,6 +34,7 @@ import torch.nn.functional as F
 
 # Optical flow
 from apple_agent.apple_picking_sb3.apple_gym.optical_flow import OpticalFlow
+from apple_agent.config import TRAIN_CONFIG
 from apple_agent.data.obs_spec import (
     CHANNEL_DIMS,
     DEPTH_MAX_M,
@@ -553,7 +554,9 @@ class RecurrentActorCriticPolicy(ActorCriticPolicySquashed):
             lstm_kwargs: Optional[Dict[str, Any]] = None,
             features_dim_critic_add: Optional[int] = None,
             image_channels=("flow", "mask"),
-            algo_size=(224, 224)
+            algo_size=(224, 224),
+            flow_size=None,
+            flow_num_updates=12,
     ):
         self.lstm_output_dim = lstm_hidden_size
         # CNN input = selected image channels stacked at algo_size (see obs_spec); () = proprio only
@@ -614,7 +617,17 @@ class RecurrentActorCriticPolicy(ActorCriticPolicySquashed):
         if not (self.shared_lstm or self.enable_critic_lstm):
             self.critic = nn.Linear(self.features_dim, lstm_hidden_size)
         if "flow" in self.image_channels:
-            self.optical_flow_model = OpticalFlow(size=self.algo_size)
+            # RAFT runs at flow_size (default: algo_size, as before); the flow is resized to algo_size in _image_stack.
+            # flow_size / flow_num_updates are policy kwargs, so a checkpoint reproduces them; the cache settings are runtime-only.
+            flow_cfg = TRAIN_CONFIG["flow"]
+            self.optical_flow_model = OpticalFlow(
+                size=tuple(flow_size or self.algo_size),
+                num_flow_updates=flow_num_updates,
+                compile=flow_cfg["compile"],
+                cache_dir=flow_cfg["cache_dir"],
+                runtime_cache_entries=flow_cfg["runtime_cache_entries"],
+                cache_dtype=flow_cfg["cache_dtype"],
+            )
         # Use a separate LSTM for the critic
         # TODO: TEST
         if self.enable_critic_lstm:
@@ -903,8 +916,10 @@ class RecurrentActorCriticPolicy(ActorCriticPolicySquashed):
         parts = []
         for channel in self.image_channels:
             if channel == "flow":
-                flow = self.optical_flow_model.calculate_optical_flow(obs["rgb"], obs["prev_rgb"])
-                parts.append(flow.to(self.device, th.float32) * FLOW_SCALE)
+                flow = self.optical_flow_model.calculate_optical_flow(obs["rgb"], obs["prev_rgb"]).to(self.device, th.float32)
+                if tuple(flow.shape[-2:]) != size:  # flow is in image-size units, so resizing keeps its values
+                    flow = F.interpolate(flow, size=size, mode="bilinear", align_corners=False)
+                parts.append(flow * FLOW_SCALE)
             elif channel == "depth":
                 depth_m = obs["depth"].to(self.device, th.float32).unsqueeze(1) / DEPTH_UNITS_PER_M
                 depth_m = F.interpolate(depth_m, size=size, mode="nearest")

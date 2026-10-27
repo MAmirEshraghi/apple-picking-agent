@@ -6,6 +6,47 @@ Paths in CONFIG['output'] are relative to the workspace (the directory commands 
 """
 import numpy as np
 
+# Learning settings for train_apple_picking_expert / eval_apple_picking_expert. Command-line flags
+# (--flow_size, --flow_updates, ...) override these for one run; the flow size / iterations and the
+# image channels are saved in the checkpoint, so eval reproduces them without reading this file.
+TRAIN_CONFIG = {
+    'algo_size': (224, 224),         # CNN input size of every image channel
+    'device': 'cuda',
+    'flow': {
+        'size': (128, 128),          # RAFT input resolution (multiples of 8, minimum 128); flow is resized to algo_size for the CNN
+        'num_flow_updates': 12,      # RAFT refinement iterations (torchvision default 12; fewer = faster)
+        'compile': False,            # torch.compile RAFT; slow to warm up and recompiles for every batch size
+        'cache_dir': 'output/flow_cache',   # precomputed flow (python -m apple_agent.data.cache_flow); None = off
+        'cache_dtype': 'float16',
+        # Flow computed while training / evaluating is kept so a buffer re-read costs nothing (0 = off).
+        # Keep it above 2 * ppo.n_steps (rollout + expert buffer) or PPO update epochs recompute flow.
+        'runtime_cache_entries': 4096,
+        'precompute_batch_size': 16,
+    },
+    'policy': {
+        'features_extractor_size': (240, 424),
+        'net_arch': {'pi': [128], 'vf': [128]},
+        'lstm_hidden_size': 128,
+        'enable_critic_lstm': True,
+        'squash_output': True,       # actions in [-1, 1] through tanh
+        'log_std_init': -1.5,
+    },
+    'ppo': {
+        'learning_rate': 1e-4,       # actor / critic (LSTMs, heads)
+        'learning_rate_ae': 3e-4,    # image encoder (CNN)
+        'learning_rate_logstd': 3e-4,  # exploration noise
+        'n_steps': 512,
+        'batch_size': 16,
+        'n_epochs': 2,
+        'gamma': 0.99,
+        'gae_lambda': 0.95,
+        'clip_range': 0.2,
+        'ent_coef': 0.001,           # also the value the warm-up callback returns to after bc_warmup_steps
+        'vf_coef': 0.25,
+        'max_grad_norm': 0.5,
+    },
+}
+
 CONFIG = {
     'simulation_setup': {
         'renders': True,
